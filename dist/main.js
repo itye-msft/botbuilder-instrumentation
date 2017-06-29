@@ -6,9 +6,17 @@ const builder = require("botbuilder");
 const request = require("request");
 const ApplicationInsights = require("applicationinsights");
 const events_1 = require("./events");
+const CURRENT_BOT_NAME = "currentBotName";
+const DefaultBotName = "*";
+function setCurrentBotName(session, botName) {
+    session.privateConversationData[CURRENT_BOT_NAME] = botName;
+    return session;
+}
+exports.setCurrentBotName = setCurrentBotName;
 class BotFrameworkInstrumentation {
     constructor(settings) {
-        this.appInsightsClients = [];
+        this.settings = settings;
+        this.currentBotName = DefaultBotName;
         this.console = {};
         this.methods = {
             "debug": 0,
@@ -17,50 +25,37 @@ class BotFrameworkInstrumentation {
             "warn": 3,
             "error": 4
         };
-        this.instrumentationKeys = [];
-        this.sentiments = {};
-        this.initSentimentData();
-        settings = settings || {};
-        _.extend(this.sentiments, settings.sentiments);
-        this.sentiments.key = this.sentiments.key || process.env.CG_SENTIMENT_KEY;
-        if (settings.instrumentationKey) {
-            this.instrumentationKeys =
-                Array.isArray(settings.instrumentationKey) ?
-                    settings.instrumentationKey :
-                    [settings.instrumentationKey];
-        }
-        else {
-            if (process.env.APPINSIGHTS_INSTRUMENTATIONKEY) {
-                this.instrumentationKeys = [process.env.APPINSIGHTS_INSTRUMENTATIONKEY];
-            }
-        }
-        if (!this.instrumentationKeys) {
-            throw new Error('App Insights instrumentation key was not provided in options or the environment variable APPINSIGHTS_INSTRUMENTATIONKEY');
-        }
-        if (!this.sentiments.key) {
-            console.warn('No sentiment key was provided - text sentiments will not be collected');
-        }
-        this.appInsightsClients = [];
-    }
-    initSentimentData() {
+        this.customFields = {
+            containerKeys: {},
+            containers: {},
+            objects: {}
+        };
         this.sentiments = {
             minWords: 3,
             url: 'https://westus.api.cognitive.microsoft.com/text/analytics/v2.0/sentiment',
             id: 'bot-analytics',
             key: null
         };
+        settings = settings || null;
+        _.extend(this.sentiments, settings.sentiments);
+        this.sentiments.key = (this.sentiments.hasOwnProperty('key')) ? this.sentiments.key : process.env.CG_SENTIMENT_KEY;
+        this.instrumentationKey = settings.instrumentationKey || process.env.APPINSIGHTS_INSTRUMENTATIONKEY;
+        if (!this.instrumentationKey) {
+            throw new Error('App Insights instrumentation key was not provided in options or the environment variable APPINSIGHTS_INSTRUMENTATIONKEY');
+        }
+        if (!this.sentiments.key) {
+            console.warn('No sentiment key was provided - text sentiments will not be collected');
+        }
     }
     formatArgs(args) {
         return util.format.apply(util.format, Array.prototype.slice.call(args));
     }
     setupConsoleCollection() {
-        // Overriding console methods so that prints to console will first be logged
-        // to application insights
         _.keys(this.methods).forEach(method => {
             console[method] = (() => {
                 let original = console.log;
                 return (...args) => {
-                    let stdout = null;
+                    let stdout;
                     try {
                         let msg = this.formatArgs(args);
                         this.trackTrace(msg, this.methods[method]);
@@ -76,16 +71,15 @@ class BotFrameworkInstrumentation {
         });
     }
     collectSentiment(session, text) {
-        text = text || '';
         if (!this.sentiments.key)
             return;
         if (text.match(/\S+/g).length < this.sentiments.minWords)
             return;
-        let message = session.message || {};
+        let message = session.message;
         let timestamp = message.timestamp;
-        let address = message.address || {};
-        let conversation = address.conversation || {};
-        let user = address.user || {};
+        let address = message.address || null;
+        let conversation = address.conversation || null;
+        let user = address.user || null;
         request({
             url: this.sentiments.url,
             method: 'POST',
@@ -129,44 +123,71 @@ class BotFrameworkInstrumentation {
             }
         });
     }
-    setupInstrumentation() {
-        if (this.instrumentationKeys && this.instrumentationKeys.length > 0) {
-            //we are setting the automatic updates to the first instumentation key.
-            ApplicationInsights.setup(this.instrumentationKeys[0])
-                .setAutoCollectConsole(true)
-                .setAutoCollectExceptions(true)
-                .setAutoCollectRequests(true)
-                .start();
-            //for all other custom events, traces etc, we are initiazling application insight clients accordignly.
-            let self = this;
-            _.forEach(this.instrumentationKeys, (iKey) => {
-                let client = ApplicationInsights.getClient(iKey);
-                self.appInsightsClients.push(client);
-            });
+    updateProps(props, customFields) {
+        if (!customFields) {
+            customFields = {};
+            for (var key in this.customFields.objects) {
+                _.extend(customFields, this.customFields.objects[key]);
+            }
+            for (var key in this.customFields.containerKeys) {
+                if (this.customFields.containerKeys.hasOwnProperty(key)) {
+                    let container = this.customFields.containers[key];
+                    let values = this.customFields.containerKeys[key];
+                    for (let key of values) {
+                        customFields[key] = (container.hasOwnProperty(key)) ? container[key] : `VALUE-FOR-KEY:'${key}'-NOT-FOUND`;
+                    }
+                }
+            }
         }
+        _.extend(props, customFields);
+        return props;
+    }
+    getBotName(session) {
+        let name = (session.privateConversationData.hasOwnProperty(CURRENT_BOT_NAME)) ? session.privateConversationData[CURRENT_BOT_NAME] : DefaultBotName;
+        if (name === DefaultBotName && session.library) {
+            name = (session.library.hasOwnProperty("name")) ? session.library.name : DefaultBotName;
+        }
+        return name;
+    }
+    prepProps(session) {
+        let message = session.message;
+        let address = message.address || null;
+        let conversation = address.conversation || null;
+        let user = address.user || null;
+        this.currentBotName = this.getBotName(session);
+        let item = {
+            text: message.text,
+            type: message.type,
+            timestamp: message.timestamp,
+            conversationId: conversation.id,
+            channel: address.channelId,
+            userId: user.id,
+            userName: user.name,
+            locale: session.preferredLocale(),
+            botName: this.currentBotName
+        };
+        console.log("\nBOTNAME: ", item.botName, "\n");
+        return this.updateProps(item);
+    }
+    setupInstrumentation(autoCollectConsole = false, autoCollectExceptions = false, autoCollectRequests = false, autoCollectPerf = false) {
+        ApplicationInsights.setup(this.instrumentationKey)
+            .setAutoCollectConsole(autoCollectConsole)
+            .setAutoCollectExceptions(autoCollectExceptions)
+            .setAutoCollectRequests(autoCollectRequests)
+            .setAutoCollectPerformance(autoCollectPerf)
+            .start();
+        this.appInsightsClient = ApplicationInsights.getClient(this.instrumentationKey);
     }
     monitor(bot) {
-        this.setupInstrumentation();
-        // Adding middleware to intercept all user messages
+        this.setupInstrumentation(this.settings.autoLogOptions.autoCollectConsole, this.settings.autoLogOptions.autoCollectExceptions, this.settings.autoLogOptions.autoCollectRequests, this.settings.autoLogOptions.autoCollectPerf);
         if (bot) {
+            this.currentBotName = bot.name;
             bot.use({
                 botbuilder: (session, next) => {
                     try {
-                        let message = session.message;
-                        let address = message.address || {};
-                        let conversation = address.conversation || {};
-                        let user = address.user || {};
-                        let item = {
-                            text: message.text,
-                            type: message.type,
-                            timestamp: message.timestamp,
-                            conversationId: conversation.id,
-                            channel: address.channelId,
-                            userId: user.id,
-                            userName: user.name
-                        };
+                        let item = this.prepProps(session);
                         this.trackEvent(events_1.default.UserMessage.name, item);
-                        self.collectSentiment(session, message.text);
+                        self.collectSentiment(session, session.message.text);
                     }
                     catch (e) {
                     }
@@ -176,20 +197,18 @@ class BotFrameworkInstrumentation {
                 },
                 send: (message, next) => {
                     try {
-                        if (message.type == "message") {
-                            let address = message.address || {};
-                            let conversation = address.conversation || {};
-                            let user = address.user || {};
-                            let item = {
-                                text: message.text,
-                                type: message.type,
-                                timestamp: message.timestamp,
-                                conversationId: conversation.id,
-                                userId: user.id,
-                                userName: user.name
-                            };
-                            this.trackEvent(events_1.default.BotMessage.name, item);
-                        }
+                        let address = message.address || null;
+                        let conversation = address.conversation || null;
+                        let user = address.user || null;
+                        let item = {
+                            text: message.text,
+                            type: message.type,
+                            timestamp: message.timestamp,
+                            conversationId: conversation.id,
+                            botName: this.currentBotName
+                        };
+                        this.updateProps(item);
+                        this.trackEvent(events_1.default.BotMessage.name, item);
                     }
                     catch (e) {
                     }
@@ -199,17 +218,16 @@ class BotFrameworkInstrumentation {
                 }
             });
         }
-        // Collect intents collected from LUIS after entities were resolved
         let self = this;
         builder.IntentDialog.prototype.recognize = (() => {
             let _recognize = builder.IntentDialog.prototype.recognize;
-            return function (context, cb) {
+            return function (session, cb) {
                 let _dialog = this;
-                _recognize.apply(_dialog, [context, (err, result) => {
-                        let message = context.message;
-                        let address = message.address || {};
-                        let conversation = address.conversation || {};
-                        let user = address.user || {};
+                _recognize.apply(_dialog, [session, (err, result) => {
+                        let message = session.message;
+                        let address = message.address || null;
+                        let conversation = address.conversation || null;
+                        let user = address.user || null;
                         let item = {
                             text: message.text,
                             timestamp: message.timestamp,
@@ -222,11 +240,9 @@ class BotFrameworkInstrumentation {
                             userId: user.id,
                             userName: user.name
                         };
-                        //there is no point sending 0 score intents to the telemetry.
                         if (item.score > 0) {
                             self.trackEvent(events_1.default.Intent.name, item);
                         }
-                        // Tracking entities for the event
                         if (result && result.entities) {
                             result.entities.forEach(value => {
                                 let entityItem = _.clone(item);
@@ -235,17 +251,41 @@ class BotFrameworkInstrumentation {
                                 self.trackEvent(events_1.default.Entity.name, entityItem);
                             });
                         }
-                        // Todo: on "set alarm" utterence, failiure
                         return cb(err, result);
                     }]);
             };
         })();
     }
-    startTransaction(context, name = '') {
-        let message = context.message;
-        let address = message.address || {};
-        let conversation = address.conversation || {};
-        let user = address.user || {};
+    setCustomFields(objectContainer, keys) {
+        if (keys) {
+            let index = Object.values(this.customFields.containers).indexOf(objectContainer);
+            let keyValues = Array.isArray(keys) ? keys : [keys];
+            if (index == -1) {
+                let idx = (Object.keys(this.customFields.containers).length - 1) <= -1 ? 0 : Object.keys(this.customFields.containers).length - 1;
+                this.customFields.containers[idx] = objectContainer;
+                this.customFields.containerKeys[idx] = keyValues;
+            }
+            else {
+                for (let key of keyValues) {
+                    if (!this.customFields.containerKeys[index].includes(key)) {
+                        this.customFields.containerKeys[index].push(key);
+                    }
+                }
+            }
+        }
+        else {
+            let index = Object.values(this.customFields.objects).indexOf(objectContainer);
+            if (index == -1) {
+                let idx = (Object.keys(this.customFields.objects).length - 1) <= -1 ? 0 : Object.keys(this.customFields.objects).length - 1;
+                this.customFields.objects[idx] = objectContainer;
+            }
+        }
+    }
+    startTransaction(session, name = '') {
+        let message = session.message;
+        let address = message.address || null;
+        let conversation = address.conversation || null;
+        let user = address.user || null;
         let item = {
             name: name,
             timestamp: message.timestamp,
@@ -256,11 +296,11 @@ class BotFrameworkInstrumentation {
         };
         this.trackEvent(events_1.default.StartTransaction.name, item);
     }
-    endTransaction(context, name = '', successful = true) {
-        let message = context.message;
-        let address = message.address || {};
-        let conversation = address.conversation || {};
-        let user = address.user || {};
+    endTransaction(session, name = '', successful = true) {
+        let message = session.message;
+        let address = message.address || null;
+        let conversation = address.conversation || null;
+        let user = address.user || null;
         let item = {
             name: name,
             successful: successful.toString(),
@@ -272,19 +312,23 @@ class BotFrameworkInstrumentation {
         };
         this.trackEvent(events_1.default.EndTransaction.name, item);
     }
-    /**
-     * Logs QNA maker service data
-     * @param context
-     * @param userQuery
-     * @param kbQuestion
-     * @param kbAnswer
-     * @param score
-     */
-    trackQNAEvent(context, userQuery, kbQuestion, kbAnswer, score) {
-        let message = context.message;
-        let address = message.address || {};
-        let conversation = address.conversation || {};
-        let user = address.user || {};
+    prepareLogData(session, item) {
+        let props = this.prepProps(session);
+        props = this.updateProps(props, item);
+        return props;
+    }
+    logCustomEvent(eventName, session, properties) {
+        properties["eventName"] = eventName;
+        this.trackEvent(events_1.default.CustomEvent.name, this.prepareLogData(session, properties));
+    }
+    logCustomError(error, session, properties) {
+        this.trackException(error, this.prepareLogData(session, properties));
+    }
+    logQNAEvent(userQuery, session, kbQuestion, kbAnswer, score) {
+        let message = session.message;
+        let address = message.address || null;
+        let conversation = address.conversation || null;
+        let user = address.user || null;
         let item = {
             score: score,
             timestamp: message.timestamp,
@@ -296,67 +340,21 @@ class BotFrameworkInstrumentation {
             kbQuestion: kbQuestion,
             kbAnswer: kbAnswer
         };
-        this.trackEvent(events_1.default.QnaEvent.name, item);
+        item = this.updateProps(item);
+        this.trackEvent(events_1.default.QnaEvent.name, this.prepareLogData(session, item));
     }
-    /**
-     * Logs your own event with custom data
-     * @param context
-     * @param eventName
-     * @param keyValuePair an object with custom properties
-     */
-    trackCustomEvent(context, eventName, keyValuePair) {
-        let message = context.message;
-        let address = message.address || {};
-        let conversation = address.conversation || {};
-        let user = address.user || {};
-        let item = {
-            timestamp: message.timestamp,
-            channel: address.channelId,
-            conversationId: conversation.id,
-            userId: user.id,
-            userName: user.name
-        };
-        //merge the custom properties with the defaults
-        let eventData = Object.assign(item, keyValuePair);
-        this.trackEvent(eventName, eventData);
-    }
-    /**
-     * Log a user action or other occurrence.
-     * @param name              A string to identify this event in the portal.
-     * @param properties        map[string, string] - additional data used to filter events and metrics in the portal. Defaults to empty.
-     * @param measurements      map[string, number] - metrics associated with this event, displayed in Metrics Explorer on the portal. Defaults to empty.
-     * @param tagOverrides      the context tags to use for this telemetry which overwrite default context values
-     * @param contextObjects    map[string, contextObject] - An event-specific context that will be passed to telemetry processors handling this event before it is sent. For a context spanning your entire operation, consider appInsights.getCorrelationContext
-     */
     trackEvent(name, properties, measurements, tagOverrides, contextObjects) {
-        _.forEach(this.appInsightsClients, (client) => {
-            client.trackEvent(name, properties);
-        });
+        console.log("\nTRACK EVENT -------\nCLIENT: ", this.instrumentationKey, "\nEVENT: ", name, "\nPROPS: ", JSON.stringify(properties, null, 2), "\nTRACK EVENT -------\n");
+        this.appInsightsClient.trackEvent(name, properties, measurements, tagOverrides, contextObjects);
     }
-    /**
-     * Log a trace message
-     * @param message        A string to identify this event in the portal.
-     * @param properties     map[string, string] - additional data used to filter events and metrics in the portal. Defaults to empty.
-     * @param tagOverrides   the context tags to use for this telemetry which overwrite default context values
-     * @param contextObjects map[string, contextObject] - An event-specific context that will be passed to telemetry processors handling this event before it is sent. For a context spanning your entire operation, consider appInsights.getCorrelationContext
-     */
     trackTrace(message, severityLevel, properties, tagOverrides, contextObjects) {
-        _.forEach(this.appInsightsClients, (client) => {
-            client.trackTrace(message, severityLevel, properties);
-        });
+        console.log("\nTRACK TRACE -------\nCLIENT: ", this.instrumentationKey, "\nEVENT: ", message, "\nSEC-LEVEL: ", severityLevel, "\nPROPS: ", JSON.stringify(properties, null, 2), "\nTRACK TRACE -------\n");
+        this.appInsightsClient.trackTrace(message, severityLevel, properties, tagOverrides, contextObjects);
     }
-    /**
-     * Log an exception you have caught.
-     * @param   exception   An Error from a catch clause, or the string error message.
-     * @param   properties  map[string, string] - additional data used to filter events and metrics in the portal. Defaults to empty.
-     * @param   measurements    map[string, number] - metrics associated with this event, displayed in Metrics Explorer on the portal. Defaults to empty.
-     * @param   tagOverrides the context tags to use for this telemetry which overwrite default context values
-     * @param   contextObjects        map[string, contextObject] - An event-specific context that will be passed to telemetry processors handling this event before it is sent. For a context spanning your entire operation, consider appInsights.getCorrelationContext
-     */
     trackException(exception, properties, measurements, tagOverrides, contextObjects) {
-        _.forEach(this.appInsightsClients, (client) => {
-            client.trackException(exception, properties);
-        });
+        console.log("\nTRACK EXCEPTION -------\nCLIENT: ", this.instrumentationKey, "\nEVENT: ", exception, "\nEXCEPTION: ", exception, "\nPROPS: ", JSON.stringify(properties, null, 2), "\nTRACK EXCEPTION -------\n");
+        this.appInsightsClient.trackException(exception, properties, measurements, tagOverrides, contextObjects);
     }
 }
 exports.BotFrameworkInstrumentation = BotFrameworkInstrumentation;
+//# sourceMappingURL=/Users/claudius/Documents/workspace/Bots/botbuilder-instrumentation/dist/main.js.map
